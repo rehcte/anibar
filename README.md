@@ -1,6 +1,83 @@
 # anibar
-mainly built off of ani-cli
 
-ani-cli repo: repo:pystardust/ani-cli 
+A personalized fork of [ani-cli](https://github.com/pystardust/ani-cli) — browse and watch anime from the terminal.
 
-Please check them out because this is just a more personalized project build off theyre work.
+All the scraping core is the work of [pystardust and the ani-cli contributors](https://github.com/pystardust/ani-cli). Please check them out — anibar is a personal build on top of their project.
+
+## What's different from ani-cli
+
+- Filemoon provider enabled for better source coverage, especially on newer seasons
+- Tracks upstream hotfixes (`fix` branch) so scraper repairs land fast
+- macOS portability fix for the API request auth (`base64 -w` is not a thing on BSD)
+- Planned: watched-episode checkmarks, mark-as-watched, and a watchlist
+
+## Install
+
+### Linux
+
+Dependencies: `curl` `fzf` `mpv` `openssl` `botan` `patch` (plus `aria2` and `ffmpeg` if you use download mode).
+
+Arch and derivatives:
+
+```sh
+sudo pacman -S --needed curl fzf mpv openssl botan patch
+```
+
+Other distros: install the equivalents from your package manager.
+
+Then:
+
+```sh
+git clone https://github.com/rehcte/anibar.git
+cd anibar
+install -Dm755 ani-cli ~/.local/bin/anibar
+```
+
+Make sure `~/.local/bin` is in your `PATH`.
+
+### macOS
+
+Install [Homebrew](https://docs.brew.sh/Installation) if you don't have it, then:
+
+```sh
+brew tap rehcte/anibar https://github.com/rehcte/anibar.git
+brew install --HEAD rehcte/anibar/anibar
+brew install --cask iina
+```
+
+If your brew complains about untrusted taps, run `brew trust rehcte/anibar` first.
+
+IINA is the recommended player on macOS (drop-in mpv replacement that integrates with the OS UI). Plain `mpv` from brew works too.
+
+## Usage
+
+```sh
+anibar <anime name>        # search and watch
+anibar -c                  # continue from history
+anibar -e 5 bleach         # jump to episode 5
+anibar -e 5-8 bleach       # episodes 5 through 8
+anibar -q 720 bleach       # pick a quality
+anibar --dub bleach        # dubbed version
+```
+
+Run `anibar -h` for everything else.
+
+## Updating
+
+Linux:
+
+```sh
+cd anibar
+git pull
+install -Dm755 ani-cli ~/.local/bin/anibar
+```
+
+macOS:
+
+```sh
+brew upgrade --fetch-HEAD rehcte/anibar/anibar
+```
+
+## Credits and license
+
+Built on [pystardust/ani-cli](https://github.com/pystardust/ani-cli), licensed [GPL-3.0](LICENSE) like the original. See their [disclaimer](disclaimer.md), which applies here too.
