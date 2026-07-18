@@ -273,7 +273,7 @@ get_aa_req() {
     (
         printf '\001'
         cat "$tmpdir/iv.bin" "$tmpdir/ct.bin" "$tmpdir/tag.bin"
-    ) | base64 -w 0
+    ) | openssl base64 -A
 }
 
 b64url_to_hex() {
