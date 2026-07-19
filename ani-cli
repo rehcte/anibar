@@ -11,7 +11,7 @@ external_menu() {
 
 launcher() {
     [ "$use_external_menu" = "0" ] && [ -z "$1" ] && set -- "+m" "$2"
-    [ "$use_external_menu" = "0" ] && fzf "$1" --reverse --cycle --prompt "$2"
+    [ "$use_external_menu" = "0" ] && fzf "$1" --ansi --reverse --cycle --prompt "$2"
     [ "$use_external_menu" = "1" ] && external_menu "$1" "$2" "$external_menu_args"
     [ "$use_external_menu" = "2" ] && external_menu "$1" "$2"
 }
@@ -31,7 +31,7 @@ nth() {
     if [ "$line_start" = "$line_end" ]; then
         printf "%s" "$stdin" | grep -E '^'"${line}"'($|[[:space:]])' | cut -f2,3 || exit 1
     else
-        printf "%s" "$stdin" | sed -n '/^'"${line_start}"'$/,/^'"${line_end}$"'/p' || exit 1
+        printf "%s" "$stdin" | awk -F'\t' -v s="$line_start" -v e="$line_end" '$1 == s, $1 == e' | grep . || exit 1
     fi
 }
 
@@ -72,6 +72,10 @@ help_info() {
         Specify the number of episodes to watch
       --dub
         Play dubbed version
+      --seen [episodes]
+        Mark episodes as watched without playing (whole series if no episodes given)
+      --unseen [episodes]
+        Remove episodes from watched marks
       --rofi
         Use rofi instead of fzf for the interactive menu
       --dmenu
@@ -397,6 +401,34 @@ update_history() {
     mv "${histfile}.new" "$histfile"
 }
 
+mark_seen() {
+    grep -q "^${id}	${ep_no}	" "$seenfile" || printf "%s\t%s\t%s\n" "$id" "$ep_no" "$title" >>"$seenfile"
+}
+
+decorate_seen() {
+    [ -s "$seenfile" ] || { cat; return; }
+    awk -F'\t' -v id="$id" 'NR == FNR { if ($1 == id) seen[$2] = 1; next }
+        { printf "%s\t%s%s\n", $1, $1, (seen[$1] ? "\t\033[1;32m✓\033[0m" : "") }' "$seenfile" -
+}
+
+apply_seen() {
+    range_start=$(printf "%s" "$seen_range" | grep -Eo '^[0-9]+(\.[0-9]+)?')
+    range_end=$(printf "%s" "$seen_range" | grep -Eo '[0-9]+(\.[0-9]+)?$')
+    [ -z "$range_start" ] && range_start=$(printf "%s\n" "$ep_list" | head -n1)
+    [ -z "$range_end" ] && range_end=$(printf "%s\n" "$ep_list" | tail -n1)
+    targets=$(printf "%s\n" "$ep_list" | awk -v s="$range_start" -v e="$range_end" '$1 + 0 >= s + 0 && $1 + 0 <= e + 0')
+    [ -z "$targets" ] && die "No episodes in range!"
+    if [ "$seen_op" = "unseen" ]; then
+        printf "%s\n" "$targets" | awk -F'\t' -v id="$id" 'NR == FNR { del[$1] = 1; next } !($1 == id && del[$2])' - "$seenfile" >"${seenfile}.new"
+        mv "${seenfile}.new" "$seenfile"
+    else
+        printf "%s\n" "$targets" | while read -r ep; do
+            grep -q "^${id}	${ep}	" "$seenfile" || printf "%s\t%s\t%s\n" "$id" "$ep" "$title" >>"$seenfile"
+        done
+    fi
+    printf "Marked %s episode(s) %s for %s\n" "$(printf "%s\n" "$targets" | grep -c .)" "$seen_op" "$title"
+}
+
 download() {
     case $1 in
         *m3u8*)
@@ -468,6 +500,7 @@ play_episode() {
     replay="$episode"
     unset episode
     update_history
+    mark_seen
     [ "$use_external_menu" = "1" ] && wait
     [ "$use_external_menu" = "2" ] && wait
 }
@@ -533,6 +566,8 @@ hist_dir="${ANI_CLI_HIST_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/ani-cli}"
 [ ! -d "$hist_dir" ] && mkdir -p "$hist_dir"
 histfile="$hist_dir/ani-hsts"
 [ ! -f "$histfile" ] && : >"$histfile"
+seenfile="$hist_dir/ani-seen"
+[ ! -f "$seenfile" ] && : >"$seenfile"
 search="${ANI_CLI_DEFAULT_SOURCE:-scrape}"
 branch="${ANI_CLI_BRANCH:-master}"
 
@@ -600,6 +635,15 @@ while [ $# -gt 0 ]; do
             [ $# -lt 2 ] && die "missing argument!"
             skip_title="$2"
             shift
+            ;;
+        --seen | --unseen)
+            seen_op="${1#--}"
+            case "$2" in
+                [0-9]*)
+                    seen_range="$2"
+                    shift
+                    ;;
+            esac
             ;;
         -N | --nextep-countdown) search=nextep ;;
         -U | --update)
@@ -671,7 +715,8 @@ case "$search" in
         allanime_title="$(printf "%s" "$title" | cut -d'(' -f1 | tr -d '[:punct:]')"
         id=$(printf "%s" "$result" | cut -f1)
         ep_list=$(episodes_list "$id")
-        [ -z "$ep_no" ] && ep_no=$(printf "%s" "$ep_list" | nth "Select episode: " "$multi_selection_flag")
+        [ -n "$seen_op" ] && apply_seen && exit 0
+        [ -z "$ep_no" ] && ep_no=$(printf "%s" "$ep_list" | decorate_seen | nth "Select episode: " "$multi_selection_flag" | cut -f1)
         [ -z "$ep_no" ] && exit 1
         ;;
 esac
@@ -691,7 +736,7 @@ while cmd=$(printf "next\nreplay\nprevious\nselect\nchange_quality\nquit" | nth 
         next) ep_no=$(printf "%s" "$ep_list" | sed -n "/^${ep_no}$/{n;p;}") 2>/dev/null ;;
         replay) episode="$replay" ;;
         previous) ep_no=$(printf "%s" "$ep_list" | sed -n "/^${ep_no}$/{g;1!p;};h") 2>/dev/null ;;
-        select) ep_no=$(printf "%s" "$ep_list" | nth "Select episode: " "$multi_selection_flag") ;;
+        select) ep_no=$(printf "%s" "$ep_list" | decorate_seen | nth "Select episode: " "$multi_selection_flag" | cut -f1) ;;
         change_quality)
             new_quality="$(printf "%s" "$links" | launcher | cut -d\> -f1)"
             select_quality "$new_quality"
