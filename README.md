@@ -6,6 +6,8 @@ All the scraping core is the work of [pystardust and the ani-cli contributors](h
 
 ## What's different from ani-cli
 
+- Watched-episode tracking: episodes you play get a green ✓ in the episode menu, the Right arrow key toggles the mark on any episode, and `--seen` / `--unseen` bulk-mark series you watched elsewhere
+- Search results sorted by release year, so seasons appear in watch order
 - Filemoon provider enabled for better source coverage, especially on newer seasons
 - Tracks upstream hotfixes (`fix` branch) so scraper repairs land fast
 - macOS portability fix for the API request auth (`base64 -w` is not a thing on BSD)
