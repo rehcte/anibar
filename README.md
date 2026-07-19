@@ -49,6 +49,26 @@ If your brew complains about untrusted taps, run `brew trust rehcte/anibar` firs
 
 IINA is the recommended player on macOS (drop-in mpv replacement that integrates with the OS UI). Plain `mpv` from brew works too.
 
+### iPhone / iPad
+
+Runs inside [iSH](https://apps.apple.com/us/app/ish-shell/id1436902243), a terminal emulator from the App Store. Playback happens in [VLC for iOS](https://apps.apple.com/us/app/vlc-media-player/id650377962) — install both first.
+
+In iSH:
+
+```sh
+apk update
+apk add git curl fzf sed grep openssl botan3 patch
+git clone https://github.com/rehcte/anibar.git
+cd anibar
+install -Dm755 ani-cli /usr/local/bin/anibar
+```
+
+If `apk` can't find `botan3`, your iSH is on an older Alpine branch — point `/etc/apk/repositories` at a newer release and `apk update` again.
+
+Run `anibar <anime name>`, pick your episode, then tap the "Tap to open VLC" link that appears — VLC opens and plays the stream.
+
+Heads up: iSH is an emulator, so the menus feel slow (playback in VLC is full speed), and a few titles that only stream from the Yt source won't play on iOS — the script filters those out because VLC-iOS can't handle them.
+
 ## Usage
 
 ```sh
