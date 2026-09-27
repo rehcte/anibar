@@ -254,11 +254,111 @@ process_response() {
     rm -f "$tmp"
 }
 
+# AES-256/GCM-encrypts stdin with hex key $1 and hex nonce $2, writes ciphertext followed by the 16-byte tag.
+# botan does the work wherever it exists. Windows has no botan package, so under Git Bash the same thing is
+# computed by the built-in Windows PowerShell: .NET provides AES-ECB, the CTR keystream and the GHASH tag are
+# done by hand below (checked against the NIST GCM test vectors). Expects $tmpdir from get_aa_req.
+aes_gcm_encrypt() {
+    if [ -n "$botan_exe" ]; then
+        $botan_exe cipher --cipher=AES-256/GCM --key="$1" --nonce="$2" -
+        return
+    fi
+    cat >"$tmpdir/gcm.ps1" <<'EOF'
+$ErrorActionPreference = 'Stop'
+function HexToBytes([string]$h) { $b = New-Object byte[] ($h.Length / 2); for ($i = 0; $i -lt $b.Length; $i++) { $b[$i] = [Convert]::ToByte($h.Substring(2 * $i, 2), 16) }; return ,$b }
+function BlockToInt([byte[]]$b) { $le = New-Object byte[] 17; for ($i = 0; $i -lt 16; $i++) { $le[$i] = $b[15 - $i] }; return New-Object System.Numerics.BigInteger (,$le) }
+function IntToBlock([System.Numerics.BigInteger]$n) { $le = $n.ToByteArray(); $b = New-Object byte[] 16; for ($i = 0; $i -lt 16 -and $i -lt $le.Length; $i++) { $b[15 - $i] = $le[$i] }; return ,$b }
+$R = BlockToInt (HexToBytes 'e1000000000000000000000000000000')
+$ONE = [System.Numerics.BigInteger]::One
+function GfMul([System.Numerics.BigInteger]$x, [System.Numerics.BigInteger]$y) {
+    $z = [System.Numerics.BigInteger]::Zero; $v = $y
+    for ($i = 127; $i -ge 0; $i--) {
+        if (-not ([System.Numerics.BigInteger]::op_BitwiseAnd([System.Numerics.BigInteger]::op_RightShift($x, $i), $ONE)).IsZero) { $z = [System.Numerics.BigInteger]::op_ExclusiveOr($z, $v) }
+        if ($v.IsEven) { $v = [System.Numerics.BigInteger]::op_RightShift($v, 1) } else { $v = [System.Numerics.BigInteger]::op_ExclusiveOr([System.Numerics.BigInteger]::op_RightShift($v, 1), $R) }
+    }
+    return $z
+}
+$iv = HexToBytes $env:ANIBAR_GCM_IV
+$pt = [Text.Encoding]::UTF8.GetBytes($env:ANIBAR_GCM_PT)
+$aes = [System.Security.Cryptography.Aes]::Create()
+$aes.Mode = [System.Security.Cryptography.CipherMode]::ECB
+$aes.Padding = [System.Security.Cryptography.PaddingMode]::None
+$aes.Key = HexToBytes $env:ANIBAR_GCM_KEY
+$enc = $aes.CreateEncryptor()
+$hb = New-Object byte[] 16
+[void]$enc.TransformBlock((New-Object byte[] 16), 0, 16, $hb, 0)
+$H = BlockToInt $hb
+$j0 = New-Object byte[] 16
+[Array]::Copy($iv, 0, $j0, 0, 12); $j0[15] = 1
+$ctr = New-Object byte[] 16
+[Array]::Copy($j0, $ctr, 16)
+$ks = New-Object byte[] 16
+$ct = New-Object byte[] $pt.Length
+for ($off = 0; $off -lt $pt.Length; $off += 16) {
+    for ($k = 15; $k -ge 12; $k--) { $ctr[$k] = ($ctr[$k] + 1) -band 0xff; if ($ctr[$k] -ne 0) { break } }
+    [void]$enc.TransformBlock($ctr, 0, 16, $ks, 0)
+    $n = [Math]::Min(16, $pt.Length - $off)
+    for ($k = 0; $k -lt $n; $k++) { $ct[$off + $k] = $pt[$off + $k] -bxor $ks[$k] }
+}
+$g = New-Object byte[] ($ct.Length + (16 - ($ct.Length % 16)) % 16 + 16)
+[Array]::Copy($ct, 0, $g, 0, $ct.Length)
+$bits = [long]($ct.Length * 8)
+for ($k = 0; $k -lt 8; $k++) { $g[$g.Length - 1 - $k] = [byte](($bits -shr (8 * $k)) -band 0xff) }
+$y = [System.Numerics.BigInteger]::Zero
+for ($off = 0; $off -lt $g.Length; $off += 16) {
+    $blk = New-Object byte[] 16
+    [Array]::Copy($g, $off, $blk, 0, 16)
+    $y = GfMul ([System.Numerics.BigInteger]::op_ExclusiveOr($y, (BlockToInt $blk))) $H
+}
+$ekj0 = New-Object byte[] 16
+[void]$enc.TransformBlock($j0, 0, 16, $ekj0, 0)
+$tag = IntToBlock ([System.Numerics.BigInteger]::op_ExclusiveOr($y, (BlockToInt $ekj0)))
+$out = New-Object byte[] ($ct.Length + 16)
+[Array]::Copy($ct, 0, $out, 0, $ct.Length)
+[Array]::Copy($tag, 0, $out, $ct.Length, 16)
+[Console]::Out.Write([Convert]::ToBase64String($out))
+EOF
+    # MSYS2_ENV_CONV_EXCL keeps Git Bash from rewriting these values as Windows paths
+    ANIBAR_GCM_KEY="$1" ANIBAR_GCM_IV="$2" ANIBAR_GCM_PT="$(cat -)" MSYS2_ENV_CONV_EXCL="ANIBAR_GCM_KEY;ANIBAR_GCM_IV;ANIBAR_GCM_PT" \
+        powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "$(cygpath -w "$tmpdir/gcm.ps1")" | base64 -d
+}
+
+hmac_sha256_hex() { # $1 hex key, $2 message
+    printf '%s' "$2" | openssl dgst -sha256 -mac HMAC -macopt hexkey:"$1" | sed 's/.*= *//'
+}
+
+# mkissa.to client handshake: signs an x-aa-boot token from the build mask, fetches this epoch's key half
+# (partB) and derives the AES key (partB XOR mask) that signs aaReq and decrypts tobeparsed.
+# Sets aa_epoch, allanime_key and mk_query_hash; cached for the rest of the run.
+aa_bootstrap() {
+    [ -n "$allanime_key" ] && return 0
+    mk_query_hash="$(printf '%s' "$mk_episode_gql" | openssl dgst -sha256 | sed 's/.*= *//')"
+    now_ms=$(($(date +%s) * 1000))
+    epoch=$((now_ms / mk_epoch_ms))
+    epochs="$epoch"
+    # the web client keeps signing with the previous epoch for a day after a switch
+    [ "$epoch" -gt 0 ] && [ $((now_ms - epoch * mk_epoch_ms)) -lt 86400000 ] && epochs="$((epoch - 1)) $epoch"
+    inner_key="$(hmac_sha256_hex "$mk_mask" "$mk_boot_label$mk_build_id")"
+    for epoch in $epochs; do
+        boot_sig="$(printf '%s' "$mk_boot_sig" | sed "s|{build_id}|$mk_build_id|g;s|{lane}|$mk_lane|g;s|{referer_host}|${allanime_refr#https://}|g;s|{key_group}|$mk_key_group|g;s|{epoch}|$epoch|g")"
+        boot="$(curl -s -A "$agent" -e "$allanime_refr/" -H "Origin: $allanime_refr" -H "x-build-id: $mk_build_id" -H "x-aa-boot: $(hmac_sha256_hex "$inner_key" "$boot_sig")" "$mk_bootstrap_url?buildId=$mk_build_id&k=$mk_lane")"
+        part_b="$(printf '%s' "$boot" | sed -nE 's|.*"partB":"([^"]*)".*|\1|p')"
+        [ -n "$part_b" ] && break
+    done
+    [ -n "$part_b" ] || die "mkissa.to refused the client handshake: ${boot:-no response}. The site rotated its crypto again; see README, \"When mkissa rotates its crypto\"."
+    aa_epoch="$(printf '%s' "$boot" | sed -nE 's|.*"epoch":([0-9]+).*|\1|p')"
+    xor_dir="$(mktemp -d)"
+    printf '%s' "$part_b" | base64 -d | od -An -t x1 | tr -d ' \n' | fold -w2 >"$xor_dir/a"
+    printf '%s' "$mk_mask" | fold -w2 >"$xor_dir/b"
+    allanime_key="$(paste -d ' ' "$xor_dir/a" "$xor_dir/b" | while read -r a b; do printf '%02x' "$((0x$a ^ 0x$b))"; done)"
+    rm -rf "$xor_dir"
+}
+
 get_aa_req() {
     ts="$(($(date +%s) / 300 * 300 * 1000))"
 
-    payload_iv="$allanime_epoch:$allanime_build_id:$allanime_query_hash:$ts"
-    payload="{\"v\":1,\"ts\":$ts,\"epoch\":$allanime_epoch,\"buildId\":\"$allanime_build_id\",\"qh\":\"$allanime_query_hash\"}"
+    payload_iv="$aa_epoch:$mk_build_id:$mk_query_hash:$ts:$mk_lane"
+    payload="{\"v\":1,\"ts\":$ts,\"epoch\":$aa_epoch,\"buildId\":\"$mk_build_id\",\"qh\":\"$mk_query_hash\",\"k\":\"$mk_lane\"}"
 
     tmpdir="$(mktemp -d)"
     trap 'rm -rf "$tmpdir"' EXIT INT
@@ -267,9 +367,10 @@ get_aa_req() {
 
     iv_hex="$(od -An -t x1 "$tmpdir/iv.bin" | tr -d ' \n')"
 
-    printf "%s" "$payload" | $botan_exe cipher --cipher=AES-256/GCM --key="$allanime_key" --nonce="$iv_hex" - >"$tmpdir/gcm_out.bin"
+    printf "%s" "$payload" | aes_gcm_encrypt "$allanime_key" "$iv_hex" >"$tmpdir/gcm_out.bin"
 
     file_size="$(wc -c <"$tmpdir/gcm_out.bin")"
+    [ "$file_size" -gt 16 ] || die "AES-GCM encryption of the API request failed (${botan_exe:-powershell.exe})"
     ct_len=$((file_size - 16))
 
     dd if="$tmpdir/gcm_out.bin" of="$tmpdir/ct.bin" bs=1 skip=0 count="$ct_len" 2>/dev/null
@@ -293,6 +394,7 @@ b64url_to_hex() {
 }
 
 get_filemoon_links() {
+    case "$1" in http*) return 0 ;; esac # direct Filemoon mirror embeds are Cloudflare-gated; only allanime's proxied JSON is handled
     response="$(curl -e "$allanime_refr" -s "https://${allanime_base}$1" -A "$agent")"
     _fm_json="$(printf '%s' "$response" | tr -d '\n ' | tr ',' '\n')"
     iv="$(printf '%s' "$_fm_json" | sed -nE 's|^"iv":"([^"]*)"$|\1|p')"
@@ -322,8 +424,10 @@ get_filemoon_links() {
 }
 
 fetch_sources() {
-    query_ext="{\"persistedQuery\":{\"version\":1,\"sha256Hash\":\"$allanime_query_hash\"}, \"aaReq\":\"$(get_aa_req)\"}"
-    api_resp="$(curl -e "$allanime_refr" -sG -A "$agent" -H "Origin: https://mkissa.to" -H "x-build-id: ${allanime_build_id:-50}" "${allanime_api}/api" --data-urlencode "variables=${query_vars}" --data-urlencode "extensions=${query_ext}")"
+    aa_bootstrap
+    aa_req="$(get_aa_req)" || exit 1
+    query_ext="{\"persistedQuery\":{\"version\":1,\"sha256Hash\":\"$mk_query_hash\"},\"k\":\"$mk_lane\",\"aaReq\":\"$aa_req\"}"
+    api_resp="$(curl -e "$allanime_refr/" -s -A "$agent" -H "Origin: $allanime_refr" -H "x-build-id: $mk_build_id" -H "Content-Type: application/json" -X POST "${allanime_api}/api" --data "{\"query\":\"$mk_episode_gql\",\"variables\":$query_vars,\"extensions\":$query_ext}")"
     resp="$(process_response "$api_resp" | tr '{}' '\n' | sed 's|\\u002F|\/|g;s|\\||g' | sed -nE 's|.*sourceUrl":"([^"]*)".*sourceName":"([^"]*)".*|\2 :\1|p')"
 }
 
@@ -335,6 +439,7 @@ get_episode_url() {
         fetch_sources
         [ -n "$resp" ] && break
         [ "$attempt" -ge 5 ] && break
+        printf '%s' "$api_resp" | grep -q 'AA_CRYPTO' && unset allanime_key aa_epoch # redo the handshake on the next try
         [ "$attempt" -eq 1 ] && printf "=== %s | id=%s ep=%s mode=%s ===\n%s\n" "$(date '+%F %T')" "$id" "$ep_no" "$mode" "$api_resp" >>"$faillog"
         wait_s=$(printf '%s' "$api_resp" | sed -nE 's/.*try again in ([0-9]+) second.*/\1/p' | head -n1)
         [ -z "$wait_s" ] && wait_s=2
@@ -367,7 +472,7 @@ search_anime() {
     #shellcheck disable=SC2016
     search_gql='query( $search: SearchInput $limit: Int $page: Int $translationType: VaildTranslationTypeEnumType $countryOrigin: VaildCountryOriginEnumType ) { shows( search: $search limit: $limit page: $page translationType: $translationType countryOrigin: $countryOrigin ) { edges { _id name availableEpisodes airedStart __typename } }}'
 
-    curl -e "$allanime_refr" -s -H "Content-Type: application/json" -X POST "${allanime_api}/api" --data "{\"variables\":{\"search\":{\"allowAdult\":false,\"allowUnknown\":false,\"query\":\"$1\"},\"limit\":40,\"page\":1,\"translationType\":\"$mode\",\"countryOrigin\":\"ALL\"},\"query\":\"$search_gql\"}" -A "$agent" | sed 's|Show|\
+    curl -e "$allanime_refr" -s -H "Content-Type: application/json" -H "Origin: $allanime_refr" -H "x-build-id: $mk_build_id" -X POST "${allanime_api}/api" --data "{\"variables\":{\"search\":{\"allowAdult\":false,\"allowUnknown\":false,\"query\":\"$1\"},\"limit\":40,\"page\":1,\"translationType\":\"$mode\",\"countryOrigin\":\"ALL\"},\"query\":\"$search_gql\"}" -A "$agent" | sed 's|Show|\
 | g' | sed -nE "s|.*_id\":\"([^\"]*)\",\"name\":\"([^\"]*)\",.*${mode}\":([1-9][^,]*).*year\":([1-9][^,]*).*|\1	\2 (\3 episodes) (\4)|p" | sed 's/\\"//g' | sed -E 's|.*\(([0-9]{4})\)$|\1	&|; t; s|^|9999	|' | sort -sn | cut -f2-
 }
 
@@ -390,7 +495,7 @@ episodes_list() {
     #shellcheck disable=SC2016
     episodes_list_gql='query ($showId: String!) { show( _id: $showId ) { _id availableEpisodesDetail }}'
 
-    curl -e "$allanime_refr" -s -H "Content-Type: application/json" -X POST "${allanime_api}/api" --data "{\"variables\":{\"showId\":\"$*\"},\"query\":\"$episodes_list_gql\"}" -A "$agent" | sed -nE "s|.*$mode\":\[([0-9.\",]*)\].*|\1|p" | sed 's|,|\
+    curl -e "$allanime_refr" -s -H "Content-Type: application/json" -H "Origin: $allanime_refr" -H "x-build-id: $mk_build_id" -X POST "${allanime_api}/api" --data "{\"variables\":{\"showId\":\"$*\"},\"query\":\"$episodes_list_gql\"}" -A "$agent" | sed -nE "s|.*$mode\":\[([0-9.\",]*)\].*|\1|p" | sed 's|,|\
 |g; s|"||g' | sort -n -k 1
 }
 
@@ -561,13 +666,21 @@ play() {
 
 # setup
 agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:150.0) Gecko/20100101 Firefox/150.0"
-allanime_refr="https://youtu-chan.com"
+allanime_refr="https://mkissa.to" # the API binds its crypto to this origin
 allanime_base="allanime.day"
-allanime_api="https://api.${allanime_base}"
-allanime_key="f34fa715e2958b8c1ebc6efa4d089acd8f196d8b83d4b6201586c00c8a52e4a8"
-allanime_query_hash="d405d0edd690624b66baba3068e0edc3ac90f1597d898a1ec8db4e5c43c00fec"
-allanime_epoch=6884
-allanime_build_id=50
+allanime_api="https://api.mkissa.net"
+# mkissa.to client-crypto constants. The site rotates the build id, mask and boot signature every week or
+# two; refresh them with tools/mkissa-oracle.js (see README). Captured 2026-09-27.
+mk_build_id="176"
+mk_mask="03872f24d1c2938aeeb22fd115eebdec78dfa0e676b022126256ce13b650529d"
+mk_boot_label="MKoylY2Snz:"
+mk_boot_sig="{build_id}/{lane}/{referer_host}/{key_group}/{epoch}"
+mk_key_group="mkissa"
+mk_lane="k7"
+mk_epoch_ms=604800000
+mk_bootstrap_url="https://api.mkissa.net/client-crypto/v1/bootstrap"
+#shellcheck disable=SC2016
+mk_episode_gql='query($showId:String!,$translationType:VaildTranslationTypeEnumType!,$episodeString:String!){episode(showId:$showId translationType:$translationType episodeString:$episodeString){sourceUrls show{_id}}}'
 mode="${ANI_CLI_MODE:-sub}"
 download_dir="${ANI_CLI_DOWNLOAD_DIR:-.}"
 log_episode="${ANI_CLI_LOG:-1}"
@@ -578,6 +691,13 @@ case "$(uname -a | cut -d " " -f 1,3-)" in
     *MINGW* | *WSL2*) player_function="${ANI_CLI_PLAYER:-mpv.exe}" ;; # Windows OS
     *ish*) player_function="${ANI_CLI_PLAYER:-iSH}" ;;                # iOS (iSH)
     *) player_function="${ANI_CLI_PLAYER:-$(where_mpv)}" ;;           # Linux OS
+esac
+
+case "$(uname -s)" in
+    MINGW* | MSYS*) # fzf on Windows runs key bindings through cmd.exe unless $SHELL is exported
+        [ -n "$SHELL" ] || SHELL="$(command -v sh)"
+        export SHELL
+        ;;
 esac
 
 no_detach="${ANI_CLI_NO_DETACH:-0}"
@@ -603,7 +723,10 @@ while [ $# -gt 0 ]; do
         -v | --vlc)
             case "$(uname -a | cut -d " " -f 1,3-)" in
                 *ndroid*) player_function="android_vlc" ;;
-                MINGW* | *WSL2*) player_function="vlc.exe" ;;
+                MINGW* | *WSL2*)
+                    command -v vlc.exe >/dev/null || PATH="$PATH:/c/Program Files/VideoLAN/VLC:/c/Program Files (x86)/VideoLAN/VLC"
+                    player_function="vlc.exe"
+                    ;;
                 *ish*) player_function="iSH" ;;
                 *) player_function="vlc" ;;
             esac
@@ -701,7 +824,13 @@ done
 [ "$external_menu_normal_window" = "1" ] && external_menu_args="-normal-window"
 printf "\33[2K\r\033[1;34mChecking dependencies...\033[0m\n"
 dep_ch "curl" "sed" "grep" || true
-botan_exe="$(command -v botan || command -v botan3)" || die 'Program "botan" not found. Please install it.'
+botan_exe="$(command -v botan || command -v botan3)"
+if [ -z "$botan_exe" ]; then
+    case "$(uname -s)" in
+        MINGW* | MSYS*) dep_ch "powershell.exe" "cygpath" ;; # Windows has no botan package: aes_gcm_encrypt falls back to PowerShell
+        *) die 'Program "botan" not found. Please install it.' ;;
+    esac
+fi
 case "$(uname -o 2>/dev/null)" in
     *ndroid*) command -v openssl >/dev/null || die 'Program "openssl" not found. On Termux, install with: pkg install openssl-tool' ;;
     *) dep_ch "openssl" || true ;;

@@ -9,8 +9,10 @@ All the scraping core is the work of [pystardust and the ani-cli contributors](h
 - Watched-episode tracking: episodes you play get a green ✓ in the episode menu, the Right arrow key toggles the mark on any episode, and `--seen` / `--unseen` bulk-mark series you watched elsewhere
 - Search results sorted by release year, so seasons appear in watch order
 - Filemoon provider enabled for better source coverage, especially on newer seasons
+- Implements mkissa.to's current client-crypto handshake (bootstrap, per-epoch key, `aaReq`), with an oracle script to refresh the constants when the site rotates them; upstream ani-cli dropped allanime instead
 - Tracks upstream hotfixes (`fix` branch) so scraper repairs land fast
 - macOS portability fix for the API request auth (`base64 -w` is not a thing on BSD)
+- Runs on Windows in Git Bash: the API auth step that needs botan elsewhere falls back to the built-in Windows PowerShell, and an `anibar.cmd` launcher makes it callable from PowerShell/cmd too
 - Planned: watched-episode checkmarks, mark-as-watched, and a watchlist
 
 ## Install
@@ -50,6 +52,41 @@ brew install --cask iina
 If your brew complains about untrusted taps, run `brew trust rehcte/anibar` first.
 
 IINA is the recommended player on macOS (drop-in mpv replacement that integrates with the OS UI). Plain `mpv` from brew works too.
+
+### Windows
+
+Runs natively in Git Bash, the shell that ships with Git for Windows — no WSL needed. Windows Terminal is the nicest way to use it, but the plain "Git Bash" window from the Start menu works too.
+
+From PowerShell, install the dependencies:
+
+```powershell
+winget install --id Git.Git -e
+winget install --id junegunn.fzf -e
+winget install --id mpv-player.mpv-CI.MSVC -e
+```
+
+Git for Windows brings `curl`, `openssl`, `patch` and the other Unix tools. Botan has no Windows package, so on Windows anibar does that step with the built-in Windows PowerShell instead — nothing extra to install. For download mode (`-d`) also add `Gyan.FFmpeg` and `aria2.aria2` the same way (`yt-dlp.yt-dlp` optional).
+
+Put `%USERPROFILE%\.local\bin` on your PATH once (still in PowerShell), then close and reopen your terminals:
+
+```powershell
+[Environment]::SetEnvironmentVariable('Path', "$([Environment]::GetEnvironmentVariable('Path', 'User'));$env:USERPROFILE\.local\bin", 'User')
+```
+
+Then in Git Bash:
+
+```sh
+git clone https://github.com/rehcte/anibar.git
+cd anibar
+install -Dm755 ani-cli ~/.local/bin/anibar
+cp anibar.cmd ~/.local/bin/
+```
+
+`anibar.cmd` is a small launcher so you can type `anibar` from PowerShell or cmd as well; skip it if you only use Git Bash. If Windows Terminal has no Git Bash tab, re-run the Git installer and tick "Add a Git Bash Profile to Windows Terminal", or just run anibar from the PowerShell tab through the launcher.
+
+VLC works too (`anibar -v`): `winget install --id VideoLAN.VLC -e`, anibar finds it in the default install folder.
+
+Moving over from Linux? Copy `~/.local/state/ani-cli/ani-hsts` and `ani-seen` to `C:\Users\<you>\.local\state\ani-cli\` to keep your history and watched marks.
 
 ### iPhone / iPad
 
@@ -99,6 +136,26 @@ macOS:
 ```sh
 brew upgrade --fetch-HEAD rehcte/anibar/anibar
 ```
+
+Windows (in Git Bash):
+
+```sh
+cd anibar
+git pull
+install -Dm755 ani-cli ~/.local/bin/anibar
+```
+
+## When mkissa rotates its crypto
+
+Source fetching talks to mkissa.to's (allanime's) client-crypto handshake: a signed `x-aa-boot` bootstrap, a per-epoch AES key and an encrypted `aaReq` token on every episode request. The site rotates the build id, the key mask and the shape of the boot signature every week or two, and anibar then stops with "mkissa.to refused the client handshake". The constants live in the `mk_*` block near the top of the main section of `ani-cli`; to refresh them, run the oracle, which drives the real site in a headless Chrome or Edge and prints a verified block to paste over the old one:
+
+```sh
+cd tools
+npm install
+node mkissa-oracle.js
+```
+
+It needs Node and a Chromium-based browser on the machine. If it exits with "scheme drift", the site changed more than the constants and the shell code needs a look.
 
 ## Credits and license
 

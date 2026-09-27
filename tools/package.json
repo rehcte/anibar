@@ -1,0 +1,11 @@
+{
+  "name": "anibar-tools",
+  "private": true,
+  "description": "Maintenance scripts for anibar (mkissa.to crypto oracle)",
+  "scripts": {
+    "oracle": "node mkissa-oracle.js"
+  },
+  "dependencies": {
+    "puppeteer-core": "^25.0.0"
+  }
+}

@@ -1,0 +1,4 @@
+# Shell scripts must keep LF endings even when checked out on Windows (Git Bash)
+* text=auto eol=lf
+*.png binary
+*.cmd text eol=crlf
